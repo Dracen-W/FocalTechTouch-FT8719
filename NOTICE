@@ -33,11 +33,20 @@ that project is copied here, and none of its hard-coded Novatek ABI is reused.
 
 ## Firmware
 
-No vendor firmware image is included, linked, generated or embedded by this
-repository. `FtsProbe.cpp` and `FtsProtocol.c` support an optional image that
-the board repository may supply through the weak `fts_board_firmware` and
-`fts_board_firmware_size` symbols. That image remains the property of its
-owner and is subject to its own distribution terms.
+The only binary in this repository is `firmware/focaltech_ts_fw_xinli.bin`, the
+FT8719 application image extracted from a merlinx device. It is proprietary
+FocalTech/ODM firmware. The MIT license in `LICENSE` does **not** cover it, and
+this project grants no right to redistribute it. See `firmware/README.md` for
+its size, checksum, format and the reason the host has to load it.
+
+Nothing links the blob automatically. `FtsProbe.cpp` and `FtsProtocol.c` take it
+through the weak `fts_board_firmware` and `fts_board_firmware_size` symbols, so a
+board can supply a different image, and a build without the file still works for
+identification. The image remains the property of its owner and is subject to its
+own distribution terms.
+
+No other firmware is included, and the firmware download code does not embed,
+generate or fetch anything.
 
 ## Trademarks
 

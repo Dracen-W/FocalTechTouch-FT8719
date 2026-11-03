@@ -48,9 +48,10 @@ fts-hid: ok
 3. **Confirm reset polarity and the IRQ line.** `FtsBoard.h` says reset is GPIO
    92 active low and IRQ is GPIO 1 with flags `0x2001`. Re-check these against
    the devicetree for the exact board revision.
-4. **Decide whether firmware is allowed.** The repository contains no image.
-   If the board does not provide `fts_board_firmware`, stage 2 cannot recover a
-   controller that is stuck in its bootloader.
+4. **Check the firmware image.** `firmware/focaltech_ts_fw_xinli.bin` is the
+   panel image; its size, checksum and slot layout are in `firmware/README.md`.
+   Confirm the checksum before flashing anything. The blob is proprietary and
+   carries its own terms.
 5. **Keep the probe off by default.** Do not add `fts-touch=` to the default
    boot arguments until stage 1 has passed.
 
@@ -59,7 +60,7 @@ fts-hid: ok
 | Argument | Effect |
 | --- | --- |
 | `fts-touch=1` | Reset, identify the controller, stop. Read-only. |
-| `fts-touch=2` | Also download firmware when the model is not `0x8719`, then read the version. |
+| `fts-touch=2` | Also write the application image into PRAM, then read the version. |
 | `fts-touch=3` | Also run the frame loop and publish touches. |
 | `fts-touch-poll=1` | Poll instead of using `fts_board_irq_wait`. |
 | `fts-touch-swap=1` | Override the board axis swap. |
@@ -94,16 +95,20 @@ What the fields mean:
 - `step <n>`: the step that was running or failed. `step 1` is bus/chip setup
   and identification.
 - `err <n>`: first error, `0` on success. Negative values are errno-style.
-- `id<hhhh>`: identified model. `8719` is the application firmware. `87a9` and
-  `87b9` are ROM/PB aliases that mean "the bootloader is running".
-- `ver<hh>`: firmware version, read at stage 2.
+- `id<hhhh>`: identified model. `8719` is what this die reports **both** in its
+  ROM and after the application starts, so the id alone does not prove that an
+  application is running. `87a9` and `87b9` are the PB/BL aliases, which do
+  identify a bootloader.
+- `ver<hh>`: firmware version, read at stage 2. A plausible non-`0x00`/`0xFF`
+  value is the first real evidence that the application is alive.
 - `fw<n>`: framing. `1` means commands carry the two-byte length field.
 - `tx/crc/poll/last/rc`: transfer errors, CRC errors, last idle-poll count,
   last protocol error, last report classification.
 
-If stage 1 returns `id87a9` or `id87b9`, the controller is alive but its
-application firmware is not running. Do not continue to stage 3; go to stage 2
-only if a board-supplied image is intentional.
+`id8719` on its own is not proof of anything: this die reports `0x8719` from both
+its ROM and its application. If stage 1 returns `id87a9` or `id87b9` the
+controller is definitely in a bootloader. Either way, continue to stage 2 to load
+the application.
 
 ### Stage 1 failure hints
 
@@ -117,17 +122,22 @@ only if a board-supplied image is intentional.
 
 ## Stage 2: firmware and version
 
-Only run this with a board-supplied image and a known-good image for the panel:
+This is the normal boot path, not an optional upgrade:
 
 ```
 fts-touch=2
 ```
 
-The probe downloads only when the identified model is not `0x8719`. The
-sequence is the vendor's RAM download path for this part: enter the bootloader,
-write the PRAM image in `4K-4` chunks with `0xAE` address/length commands, ask
-the bootloader to compute ECC, compare it with the host ECC, then start the
-application with `0x08`.
+The probe always writes the image when one is supplied. It cannot use the model
+to decide whether a download is needed, because this die reports `0x8719` in both
+ROM and application mode, and the vendor driver also downloads on every boot.
+
+The sequence is the vendor's RAM download path for this part: reset into the
+bootloader, write the PRAM image in `4K-4` chunks with `0xAE` address/length
+commands, ask the bootloader to compute ECC, compare it with the host ECC, then
+start the application with `0x08`. Only the application slot at offset `0` is
+written; the second 64 KiB slot in the file is ignored, exactly as the vendor
+driver ignores it.
 
 Expected result after a successful download:
 
@@ -137,10 +147,12 @@ FTS stage 2/2 step 2 err 0 id8719 ver42
 
 Cautions:
 
-- A failed download can leave the controller in its bootloader. Keep the
-  firmware image and the board recovery path available.
+- A failed download can leave the controller in its bootloader. The probe resets
+  and retries three times; if all three fail the panel stays dark until the next
+  boot.
 - Do not use an image from a different panel or a different FT8719 vendor.
-- The repository deliberately does not embed, fetch or generate firmware.
+- The image in `firmware/` is proprietary and is not covered by `LICENSE`. Check
+  its SHA-256 against `firmware/README.md` before trusting it.
 - The driver uses the conservative slow packet size. It does not run the
   vendor's fast-download negotiation.
 
@@ -173,9 +185,10 @@ slower and uses more CPU, but it isolates the IRQ wiring from the SPI path.
 Record the result of each item. Do not mark the driver validated until all of
 them pass on a real merlinx.
 
-- [ ] Stage 1 identifies `id8719`.
-- [ ] Stage 1 leaves `tx`, `crc`, `bad` at zero after several minutes.
-- [ ] Stage 2 reads a plausible firmware version (`ver` is not `0x00`/`0xFF`).
+- [ ] Stage 1 identifies `id8719` and leaves `tx`, `crc`, `bad` at zero.
+- [ ] Stage 2 completes the download and reads a plausible firmware version
+      (`ver` is not `0x00`/`0xFF`).
+- [ ] Touch reports only appear after stage 2, never before it.
 - [ ] Stage 3 reports a single finger at the expected panel position.
 - [ ] A second finger produces a second contact with a distinct hardware id.
 - [ ] Ten fingers are reported (or the panel's real maximum) without lost ids.
@@ -232,8 +245,13 @@ download is in progress.
 
 - The probe is a bring-up and validation driver, not a finished HID driver. The
   board's HID source reads the seqlock snapshot and owns the report descriptor.
-- Only the FT8719 is supported. The ROM/PB aliases are accepted for
+- Only the FT8719 is supported. The PB/BL aliases are accepted for
   identification, not as a substitute for application firmware.
+- The controller runs from program RAM, so the application has to be written on
+  every cold boot. There is no persistence and no on-chip flash path in this
+  driver.
+- The image in `firmware/` matches one merlinx panel. A different panel needs a
+  different image; the driver will still download whatever the board supplies.
 - The driver always uses the conservative firmware packet size. Fast download
   is not negotiated.
 - There is no ESD workqueue and no gesture, glove, cover, charger or proximity

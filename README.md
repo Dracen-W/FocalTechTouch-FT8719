@@ -20,7 +20,8 @@ The protocol and core layers are host-tested with a fake bus. The XNU probe is
 deliberately thin: it does not contain a MediaTek SPI engine, GPIO driver or
 clock driver. The board repository supplies those through weak symbols.
 
-No vendor firmware is included. See `NOTICE` for provenance.
+The panel firmware that the host has to load is in `firmware/`; it is
+proprietary and not covered by the MIT license. See `NOTICE` for provenance.
 
 ## Status
 
@@ -103,16 +104,18 @@ int  fts_board_irq_wait(void *context, unsigned timeout_ms);
 the timeout expires, and another negative value on a board error. It is
 optional; without it, the probe polls.
 
-The board may also provide:
+The board also provides the firmware image:
 
 ```c
 extern const uint8_t  fts_board_firmware[];
 extern const uint32_t fts_board_firmware_size;
 ```
 
-The image is not part of this repository. If it is absent, the probe can still
-identify a running controller, but it cannot recover a controller that is stuck
-in its bootloader.
+`firmware/focaltech_ts_fw_xinli.bin` is the merlinx image. It is not linked
+automatically: the board converts it to a C array at build time and defines both
+symbols. A build without it can still identify the controller, but this part
+runs from program RAM, so a cold boot without the download leaves the
+application stopped. See [`firmware/README.md`](firmware/README.md).
 
 Entry points:
 
@@ -145,7 +148,7 @@ volatile int fts_touch_last_x, fts_touch_last_y;
 | Argument | Meaning |
 | --- | --- |
 | `fts-touch=1` | Reset, identify the controller, stop |
-| `fts-touch=2` | Also download firmware if needed and read the version |
+| `fts-touch=2` | Also load `firmware/` into the controller and read the version |
 | `fts-touch=3` | Also start the frame loop and publish touches |
 | `fts-touch-poll=1` | Poll instead of using `fts_board_irq_wait` |
 | `fts-touch-swap=1` | Override the board axis swap |
@@ -153,7 +156,9 @@ volatile int fts_touch_last_x, fts_touch_last_y;
 | `fts-touch-invert-y=1` | Override Y inversion |
 
 Stage 1 is the safe first boot. It performs a read-only identification. Stage 2
-may write firmware; use it only when a board-supplied image is intentional.
+writes the application image into the controller's program RAM. On this part the
+download is not an upgrade: the controller does not boot from on-chip flash, so
+stage 2 is what makes the panel usable after a reset.
 
 ## HID output
 
@@ -188,6 +193,23 @@ From the merlinx devicetree:
 The devicetree node is Novatek-named because merlin shares one bus node between
 panels; the same node lists `focaltech,fts`. See `FtsBoard.h` for the exact
 source comments.
+
+## Firmware
+
+| Field | Value |
+| --- | --- |
+| File | `firmware/focaltech_ts_fw_xinli.bin` |
+| Size | 131072 bytes, two 64 KiB application slots |
+| SHA-256 | `05296053fd79eb961da2ecfc3b0ff88b93a7fc431f71065d8584b449bcb7a30a` |
+| Source | `/vendor/firmware/focaltech_ts_fw_xinli.bin` on the device |
+
+The driver uses slot A only: it validates the length pair at `0x100` and writes
+`0xF124` bytes to PRAM, which is exactly what the vendor driver does. Slot B is
+part of the shipped image and is kept for byte-for-byte comparison.
+
+This binary is proprietary and is not covered by `LICENSE`. See
+[`firmware/README.md`](firmware/README.md) for the format, the checksum and the
+build-time glue that turns it into `fts_board_firmware[]`.
 
 ## Build and test
 

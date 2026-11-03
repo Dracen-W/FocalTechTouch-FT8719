@@ -386,13 +386,17 @@ void touchThread(void *parameter, wait_result_t)
             break;
         }
 
-        if (session->model != FTS_MODEL_FT8719) {
+        {
             int result;
 
             if (!haveFirmware()) {
                 fail(2, -2);
                 break;
             }
+            // The ROM and the application report the same id on this die, so
+            // the model cannot tell whether an application is already running.
+            // The vendor driver loads the image on every boot for the same
+            // reason; a controller left in its ROM never reports touches.
             mark(*session, 2);
             result = fts_firmware_download(&session->chip, fts_board_firmware,
                                            fts_board_firmware_size);

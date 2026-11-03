@@ -18,7 +18,8 @@
 协议层和触摸核心层通过假总线在主机上测试。XNU 探针刻意保持很薄：它不包含
 MediaTek SPI 引擎、GPIO 驱动或时钟驱动，这些由板级仓库通过弱符号提供。
 
-仓库不包含任何厂商固件。来源与 GPL 边界见 `NOTICE`。
+主机需要下发的面板固件放在 `firmware/`，该文件是专有二进制，不受 MIT 许可覆盖。
+来源与边界见 `NOTICE`。
 
 ## 状态
 
@@ -92,15 +93,17 @@ int  fts_board_irq_wait(void *context, unsigned timeout_ms);
 `fts_board_irq_wait` 在有一帧就绪时返回 `0`，超时返回 `FTS_ERR_TIMEOUT`，板级
 错误返回其他负值。它是可选的；不提供时探针会轮询。
 
-板级还可以提供：
+板级还需要提供固件镜像：
 
 ```c
 extern const uint8_t  fts_board_firmware[];
 extern const uint32_t fts_board_firmware_size;
 ```
 
-固件镜像不属于本仓库。如果板级没有提供镜像，探针仍可识别正在运行的应用
-固件，但无法恢复卡在 bootloader 里的控制器。
+`firmware/focaltech_ts_fw_xinli.bin` 就是 merlinx 的镜像。它不会被自动链接：
+板级在构建时把它转成 C 数组并定义这两个符号。没有镜像时仍可识别控制器，但这颗
+芯片从程序 RAM 运行，冷启动不下载应用就会停住。详见
+[`firmware/README.zh-CN.md`](firmware/README.zh-CN.md)。
 
 入口函数：
 
@@ -132,15 +135,16 @@ volatile int fts_touch_last_x, fts_touch_last_y;
 | 参数 | 含义 |
 | --- | --- |
 | `fts-touch=1` | 复位并识别控制器，然后停止 |
-| `fts-touch=2` | 需要时下载固件，并读取固件版本 |
+| `fts-touch=2` | 把 `firmware/` 写入控制器，并读取固件版本 |
 | `fts-touch=3` | 同时启动帧循环并发布触摸 |
 | `fts-touch-poll=1` | 不使用 `fts_board_irq_wait`，改为轮询 |
 | `fts-touch-swap=1` | 覆盖板级坐标轴交换 |
 | `fts-touch-invert-x=1` | 覆盖 X 轴反转 |
 | `fts-touch-invert-y=1` | 覆盖 Y 轴反转 |
 
-Stage 1 是安全的首次启动，只做只读识别。Stage 2 可能写固件；只有在明确要使用
-板级提供的镜像时才使用。
+Stage 1 是安全的首次启动，只做只读识别。Stage 2 把应用镜像写进控制器的程序
+RAM。在这颗芯片上这不是“升级”：控制器不从片上 flash 启动，所以复位之后要靠
+stage 2 才能让面板真正可用。
 
 ## HID 输出
 
@@ -173,6 +177,22 @@ extern volatile uint32_t fts_touch_tips[FTS_HID_MAX_POINTS];
 
 设备树节点名是 Novatek，因为 merlin 的两块面板共用同一个总线节点；同一节点
 同时列出了 `focaltech,fts`。具体来源注释见 `FtsBoard.h`。
+
+## 固件
+
+| 项目 | 值 |
+| --- | --- |
+| 文件 | `firmware/focaltech_ts_fw_xinli.bin` |
+| 大小 | 131072 字节，两个 64 KiB 应用槽 |
+| SHA-256 | `05296053fd79eb961da2ecfc3b0ff88b93a7fc431f71065d8584b449bcb7a30a` |
+| 来源 | 设备上的 `/vendor/firmware/focaltech_ts_fw_xinli.bin` |
+
+驱动只使用槽 A：校验 `0x100` 处的长度对，然后把 `0xF124` 字节写进 PRAM，与
+vendor 驱动的行为完全一致。槽 B 属于设备发布的原始镜像，保留它是为了逐字节比对。
+
+这个二进制是专有的，不受 `LICENSE` 覆盖。格式、校验和以及把它变成
+`fts_board_firmware[]` 的构建接法见
+[`firmware/README.zh-CN.md`](firmware/README.zh-CN.md)。
 
 ## 构建与测试
 

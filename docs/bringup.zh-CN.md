@@ -44,8 +44,9 @@ fts-hid: ok
    本仓库不包含 MediaTek SPI 驱动。
 3. **确认复位极性和 IRQ 线。** `FtsBoard.h` 写的是复位 GPIO 92 低有效、IRQ
    GPIO 1、flags `0x2001`。请按具体板子版本的设备树再核对一次。
-4. **决定是否允许写固件。** 仓库不包含镜像。如果板级没有提供
-   `fts_board_firmware`，stage 2 无法恢复卡在 bootloader 里的控制器。
+4. **核对固件镜像。** `firmware/focaltech_ts_fw_xinli.bin` 是这块面板的镜像，大小、
+   校验和和槽布局见 `firmware/README.zh-CN.md`。动手之前先核对校验和。该 blob 是
+   专有固件，适用它自己的条款。
 5. **保持探针默认关闭。** 在 stage 1 通过之前，不要把 `fts-touch=` 加进默认
    启动参数。
 
@@ -54,7 +55,7 @@ fts-hid: ok
 | 参数 | 作用 |
 | --- | --- |
 | `fts-touch=1` | 复位、识别控制器，然后停止。只读。 |
-| `fts-touch=2` | 型号不是 `0x8719` 时下载固件，然后读取版本。 |
+| `fts-touch=2` | 把应用镜像写进 PRAM，然后读取版本。 |
 | `fts-touch=3` | 同时启动帧循环并发布触摸。 |
 | `fts-touch-poll=1` | 不使用 `fts_board_irq_wait`，改为轮询。 |
 | `fts-touch-swap=1` | 覆盖板级坐标轴交换。 |
@@ -86,15 +87,18 @@ FTS last -1,-1 rel0 dup0 range0 drop0
 - `stage <done>/<requested>`：阶段进度。`stage 1/1` 表示 stage 1 完成。
 - `step <n>`：正在执行或失败的步骤。`step 1` 是总线/chip 初始化和识别。
 - `err <n>`：第一个错误，成功时为 `0`。负值采用 errno 风格。
-- `id<hhhh>`：识别出的型号。`8719` 表示应用固件正在运行。`87a9` 和 `87b9`
-  是 ROM/PB 别名，表示“当前在 bootloader”。
-- `ver<hh>`：固件版本，在 stage 2 读取。
+- `id<hhhh>`：识别出的型号。这颗芯片在 ROM 里和应用启动后**都**上报 `8719`，
+  所以单看 id 不能证明应用正在运行。`87a9` 和 `87b9` 是 PB/BL 别名，只有它们
+  才能确定当前在 bootloader。
+- `ver<hh>`：固件版本，在 stage 2 读取。一个合理的、非 `0x00`/`0xFF` 的值才是
+  应用真正活着的第一个证据。
 - `fw<n>`：framing。`1` 表示命令带两字节长度字段。
 - `tx/crc/poll/last/rc`：传输错误数、CRC 错误数、最后一次空闲轮询次数、
   最后一次协议错误、最后一次报告分类。
 
-如果 stage 1 返回 `id87a9` 或 `id87b9`，说明控制器活着，但应用固件没有运行。
-不要继续 stage 3；只有在明确要使用板级镜像时才进入 stage 2。
+单看 `id8719` 本身说明不了什么：这颗芯片在 ROM 和应用模式下都上报 `0x8719`。
+如果 stage 1 返回 `id87a9` 或 `id87b9`，那控制器确定在 bootloader 里。无论哪种
+情况，都继续进入 stage 2 加载应用。
 
 ### Stage 1 失败提示
 
@@ -108,15 +112,19 @@ FTS last -1,-1 rel0 dup0 range0 drop0
 
 ## Stage 2：固件与版本
 
-只有在板级提供镜像、并且镜像是该面板的已知良好版本时才运行：
+这是正常的启动路径，不是可选的升级步骤：
 
 ```
 fts-touch=2
 ```
 
-只有识别出的型号不是 `0x8719` 时才会下载。流程采用 vendor 针对该型号的 RAM
-下载路径：进入 bootloader，用 `0xAE` 地址/长度命令按 `4K-4` 分块写 PRAM，
-让 bootloader 计算 ECC，与主机 ECC 比较，然后用 `0x08` 启动应用。
+只要板级提供了镜像，探针就会写入。它无法用型号判断是否需要下载，因为这颗芯片
+在 ROM 和应用模式下都上报 `0x8719`，vendor 驱动同样是每次启动都下载。
+
+流程采用 vendor 针对该型号的 RAM 下载路径：先复位进入 bootloader，用 `0xAE`
+地址/长度命令按 `4K-4` 分块写 PRAM，让 bootloader 计算 ECC，与主机 ECC 比较，
+然后用 `0x08` 启动应用。只写文件偏移 `0` 处的应用槽；文件里第二个 64 KiB 槽会被
+忽略，与 vendor 驱动的行为一致。
 
 下载成功后的预期结果：
 
@@ -126,9 +134,11 @@ FTS stage 2/2 step 2 err 0 id8719 ver42
 
 注意事项：
 
-- 下载失败可能让控制器停在 bootloader。请确保固件镜像和板级恢复路径都可用。
+- 下载失败可能让控制器停在 bootloader。探针会复位并重试三次；三次都失败的话面板
+  会一直黑到下次开机。
 - 不要使用其他面板或其他 FT8719 供应商的镜像。
-- 本仓库刻意不内嵌、不下载、不生成固件。
+- `firmware/` 里的镜像是专有固件，不受 `LICENSE` 覆盖。信任它之前先按
+  `firmware/README.zh-CN.md` 核对 SHA-256。
 - 驱动使用保守的慢速包大小，不执行 vendor 的 fast-download 协商。
 
 ## Stage 3：帧循环
@@ -157,9 +167,9 @@ fts-touch=3
 
 逐项记录结果。只有全部在真实 merlinx 上通过，才能把驱动标记为已验证。
 
-- [ ] Stage 1 识别出 `id8719`。
-- [ ] Stage 1 运行数分钟后 `tx`、`crc`、`bad` 仍为 0。
-- [ ] Stage 2 读到合理的固件版本（`ver` 不是 `0x00`/`0xFF`）。
+- [ ] Stage 1 识别出 `id8719`，且 `tx`、`crc`、`bad` 保持为 0。
+- [ ] Stage 2 完成下载，并读到合理的固件版本（`ver` 不是 `0x00`/`0xFF`）。
+- [ ] 触摸报告只在 stage 2 之后出现，之前从不出现。
 - [ ] Stage 3 单指上报位置符合预期。
 - [ ] 第二根手指产生第二个触点，且硬件 id 不同。
 - [ ] 十指（或面板真实上限）都能上报，没有 id 丢失。
@@ -210,7 +220,11 @@ fts-touch=3
 
 - 探针是 bring-up 与验证驱动，不是完整的 HID 驱动。板级 HID 源读取 seqlock
   快照，并自己拥有 report descriptor。
-- 只支持 FT8719。ROM/PB 别名只用于识别，不能替代应用固件。
+- 只支持 FT8719。PB/BL 别名只用于识别，不能替代应用固件。
+- 控制器从程序 RAM 运行，所以每次冷启动都必须写入应用。本驱动没有持久化，也
+  没有片上 flash 路径。
+- `firmware/` 里的镜像只对应一种 merlinx 面板。换面板就需要换镜像；驱动仍会
+  照常下载板级提供的任何镜像。
 - 驱动始终使用保守的固件包大小，不协商 fast download。
 - 没有 ESD workqueue，也没有手势、手套、皮套、充电器或接近感应处理；这些
   vendor 功能不在本仓库范围内。
