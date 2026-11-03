@@ -1,0 +1,11 @@
+# Host test binaries
+build/
+
+# Object files and kernel-extension products
+*.o
+*.d
+*.dSYM/
+*.kext/
+
+# macOS noise
+.DS_Store

@@ -1,0 +1,45 @@
+# Provenance and licensing notice
+
+This repository is an independent, MIT-licensed implementation of a host-side
+driver for the FocalTech FT8719 touch controller.
+
+## Vendor driver
+
+The wire behaviour in `FtsProtocol.c` was derived by reading the Linux driver at
+
+    Dracen-W/android_kernel_xiaomi_mt6768_S
+    branch Lineage-24.0-merlin-4.19-r49p1-features-stable
+    drivers/input/touchscreen/mediatek/FT8719P
+
+That driver is licensed under the GNU General Public License, version 2. It was
+used only as a source of observable protocol facts: package bytes, register
+numbers, command sequences, timing constants, the CRC polynomial and initial
+value, the touch record layout, and the firmware download sequence. No source
+code, comment, table or data file from that driver is copied into this
+repository, and this repository is not a derivative work of it. The
+implementation here is written from those facts and is released under the MIT
+license in `LICENSE`.
+
+The GPL-2.0 vendor driver is not vendored here. Do not copy code from it into
+this tree.
+
+## Structural reference
+
+The repository layout and the staged bring-up approach follow
+`UniXNU/ShengNovatekTouch`, which is licensed under
+BSD-2-Clause-Patent. Only the structure and the idea of a portable protocol
+layer, a pure touch core, and a default-off XNU probe were used. No code from
+that project is copied here, and none of its hard-coded Novatek ABI is reused.
+
+## Firmware
+
+No vendor firmware image is included, linked, generated or embedded by this
+repository. `FtsProbe.cpp` and `FtsProtocol.c` support an optional image that
+the board repository may supply through the weak `fts_board_firmware` and
+`fts_board_firmware_size` symbols. That image remains the property of its
+owner and is subject to its own distribution terms.
+
+## Trademarks
+
+FocalTech, Redmi, Xiaomi and MediaTek are trademarks of their respective
+owners. This project is not affiliated with or endorsed by them.
