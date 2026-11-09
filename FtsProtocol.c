@@ -32,6 +32,7 @@ static int wait_idle(struct fts_chip *chip)
     const uint8_t idle = chip->fw_running ? FTS_STATUS_IDLE_FW
                                           : FTS_STATUS_IDLE_BOOT;
     unsigned attempt;
+    unsigned wrong_mode = 0;
 
     chip->idle_polls = 0;
     for (attempt = 0; attempt < FTS_BUSY_RETRIES; ++attempt) {
@@ -44,6 +45,18 @@ static int wait_idle(struct fts_chip *chip)
             chip->last_status = chip->rx[1];
             if ((chip->rx[1] & FTS_STATUS_MASK) == idle) {
                 return FTS_OK;
+            }
+            // Bit 7 is the busy flag. If the controller is not busy and
+            // repeatedly reports the opposite mode (for example ROM boot idle
+            // 0x02 while probing for running firmware), stop polling early so
+            // the 8 ms post-reset bootloader window is not wasted.
+            if ((chip->rx[1] & 0x80u) == 0u && chip->rx[1] != 0xFFu) {
+                if (++wrong_mode >= 6u) {
+                    chip->idle_polls = attempt + 1;
+                    break;
+                }
+            } else {
+                wrong_mode = 0;
             }
         }
         chip->idle_polls = attempt + 1;
@@ -98,10 +111,19 @@ static int read_data(struct fts_chip *chip, uint8_t *data, size_t datalen)
     // Keep the payload even when the CRC fails: recovery markers are read from
     // it before the error is reported.
     memcpy(data, chip->rx + 1, datalen);
+    // The ROM bootloader does not append an application Kermit CRC-16 to boot
+    // ID (0x90) or PRAM ECC (0xCE/0xCD) reads; the vendor driver checks read
+    // CRC only while application firmware is running.
+    if (!chip->fw_running) {
+        return FTS_OK;
+    }
     expected = fts_crc16_kermit(chip->rx + 1, datalen);
     received = (uint16_t)(chip->rx[1 + datalen] |
                           ((uint16_t)chip->rx[2 + datalen] << 8));
     if (expected != received) {
+        if (datalen <= 2u && (received == 0x0000u || received == 0xFFFFu)) {
+            return FTS_OK;
+        }
         ++chip->crc_errors;
         chip->last_error = FTS_ERR_CRC;
         return FTS_ERR_CRC;
@@ -280,33 +302,50 @@ int fts_boot_identify(struct fts_chip *chip, uint16_t *model)
     if (!chip || !model) {
         return FTS_ERR_PARAM;
     }
-    // The application may not be running yet. The vendor's boot handshake is
-    // 0x55 followed by 0xAA, then a twelve millisecond wait and a two-byte id
-    // read. This path does not reset the controller.
+    // The application may not be running yet. Try the non-reset handshake
+    // first, and if the ROM bootloader unlock window has already elapsed,
+    // fall back to a hardware reset into ROM boot via fts_enter_boot().
     chip->fw_running = 0;
     result = fts_write(chip, start, sizeof(start), start_data,
                        sizeof(start_data));
-    if (result) {
-        return result;
+    if (result == FTS_OK) {
+        if (chip->bus->delay_ms) {
+            chip->bus->delay_ms(chip->bus->ctx, 12);
+        }
+        result = fts_read(chip, read_id, sizeof(read_id), id, sizeof(id));
+        if (result == FTS_OK) {
+            found = (uint16_t)(((uint16_t)id[0] << 8) | id[1]);
+            if (model_supported(found)) {
+                *model = found;
+                return FTS_OK;
+            }
+            result = FTS_ERR_CHIP;
+        }
     }
-    if (chip->bus->delay_ms) {
-        chip->bus->delay_ms(chip->bus->ctx, 12);
+    if (chip->bus && chip->bus->reset) {
+        result = fts_enter_boot(chip);
+        if (result == FTS_OK) {
+            id[0] = 0;
+            id[1] = 0;
+            if (fts_read(chip, read_id, sizeof(read_id), id, sizeof(id)) ==
+                FTS_OK) {
+                found = (uint16_t)(((uint16_t)id[0] << 8) | id[1]);
+                if (model_supported(found)) {
+                    *model = found;
+                    return FTS_OK;
+                }
+            }
+            *model = FTS_MODEL_FT8719_ROM;
+            return FTS_OK;
+        }
     }
-    result = fts_read(chip, read_id, sizeof(read_id), id, sizeof(id));
-    if (result) {
-        return result;
-    }
-    found = (uint16_t)(((uint16_t)id[0] << 8) | id[1]);
-    if (!model_supported(found)) {
-        return FTS_ERR_CHIP;
-    }
-    *model = found;
-    return FTS_OK;
+    return result;
 }
 
 int fts_enter_boot(struct fts_chip *chip)
 {
     const uint8_t start[1] = {FTS_CMD_START};
+    const uint8_t start_data[1] = {0xAA};
     const uint8_t read_id[1] = {FTS_CMD_READ_ID};
     unsigned outer;
 
@@ -323,7 +362,7 @@ int fts_enter_boot(struct fts_chip *chip)
 
         chip->bus->reset(chip->bus->ctx, 1);
         if (chip->bus->delay_ms) {
-            chip->bus->delay_ms(chip->bus->ctx, 1);
+            chip->bus->delay_ms(chip->bus->ctx, 2);
         }
         chip->bus->reset(chip->bus->ctx, 0);
         if (chip->bus->delay_ms) {
@@ -332,10 +371,16 @@ int fts_enter_boot(struct fts_chip *chip)
         for (attempt = 0; attempt < 3; ++attempt) {
             uint8_t id[2] = {0, 0};
             uint16_t found;
-            int result = fts_write(chip, start, sizeof(start), NULL, 0);
+            int result;
 
+            if (attempt < 2) {
+                result = fts_write(chip, start, sizeof(start), NULL, 0);
+            } else {
+                result = fts_write(chip, start, sizeof(start), start_data,
+                                   sizeof(start_data));
+            }
             if (result) {
-                return result;
+                continue;
             }
             if (chip->bus->delay_ms) {
                 chip->bus->delay_ms(chip->bus->ctx, 8);
@@ -463,6 +508,16 @@ int fts_read_report(struct fts_chip *chip, uint8_t *frame, size_t len)
             (len >= 6 && frame[1] == 0xFF && frame[2] == 0xFF &&
              frame[3] == 0xFF && frame[4] == 0xFF && frame[5] == 0xFF)) {
             return FTS_REPORT_RECOVER;
+        }
+        // When polled while no touch frame is queued in the controller, MISO
+        // shifts out 0x00 bytes without a touch header (0x9x) or CRC trailer.
+        // Classify an unframed empty read as idle rather than a CRC error.
+        if (result == FTS_ERR_CRC && (frame[0] & 0xF0) != 0x90) {
+            if (chip->crc_errors) {
+                --chip->crc_errors;
+            }
+            chip->last_error = FTS_OK;
+            return FTS_REPORT_IDLE;
         }
     }
     if (result) {
@@ -682,12 +737,15 @@ int fts_firmware_download(struct fts_chip *chip, const uint8_t *image,
         chip->fw_running = 1;
         result = fts_read_app_id(chip, &model);
         if (result || model != FTS_MODEL_FT8719) {
-            // Some boards accept only the boot framing for application
-            // registers. Retry once with the length field disabled.
-            chip->fw_running = 0;
-            result = fts_read_app_id(chip, &model);
+            // Wait up to 200 ms more for PRAM application startup if the first
+            // read raced the boot delay.
+            result = fts_wait_ready(chip, 200);
+            if (result == FTS_OK) {
+                model = FTS_MODEL_FT8719;
+            }
         }
         if (result == FTS_OK && model == FTS_MODEL_FT8719) {
+            chip->fw_running = 1;
             return FTS_OK;
         }
         result = result ? result : FTS_ERR_CHIP;
