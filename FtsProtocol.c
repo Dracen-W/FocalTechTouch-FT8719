@@ -46,11 +46,14 @@ static int wait_idle(struct fts_chip *chip)
             if ((chip->rx[1] & FTS_STATUS_MASK) == idle) {
                 return FTS_OK;
             }
-            // Bit 7 is the busy flag. If the controller is not busy and
-            // repeatedly reports the opposite mode (for example ROM boot idle
-            // 0x02 while probing for running firmware), stop polling early so
-            // the 8 ms post-reset bootloader window is not wasted.
+            // Bit 7 is the busy flag. In ROM boot mode any non-busy, non-0xFF
+            // status byte indicates the slave is ready to accept the next
+            // package. While probing for running firmware, stop polling early
+            // if the controller repeatedly reports boot mode (0x02/0x00).
             if ((chip->rx[1] & 0x80u) == 0u && chip->rx[1] != 0xFFu) {
+                if (!chip->fw_running) {
+                    return FTS_OK;
+                }
                 if (++wrong_mode >= 6u) {
                     chip->idle_polls = attempt + 1;
                     break;
@@ -270,7 +273,38 @@ int fts_read_app_id(struct fts_chip *chip, uint16_t *model)
 static int model_supported(uint16_t model)
 {
     return model == FTS_MODEL_FT8719 || model == FTS_MODEL_FT8719_ROM ||
-           model == FTS_MODEL_FT8719_PB;
+            model == FTS_MODEL_FT8719_PB;
+}
+
+static int read_boot_id(struct fts_chip *chip, uint16_t *out_model)
+{
+    const uint8_t read_id[1] = {FTS_CMD_READ_ID};
+    uint8_t id[2] = {0, 0};
+    uint16_t found;
+    int result;
+
+    result = fts_read(chip, read_id, sizeof(read_id), id, sizeof(id));
+    if (result == FTS_OK) {
+        found = (uint16_t)(((uint16_t)id[0] << 8) | id[1]);
+        if (model_supported(found)) {
+            *out_model = found;
+            return FTS_OK;
+        }
+    }
+    // Fallback: some ROM bootloader revisions expect control byte 0x80
+    // (read without DATA_CRC_EN bit 0x20) when reading 0x90.
+    if (wait_idle(chip) == FTS_OK &&
+        send_command(chip, 0x80u, read_id, sizeof(read_id), sizeof(id), 0) ==
+            FTS_OK &&
+        wait_idle(chip) == FTS_OK &&
+        read_data(chip, id, sizeof(id)) == FTS_OK) {
+        found = (uint16_t)(((uint16_t)id[0] << 8) | id[1]);
+        if (model_supported(found)) {
+            *out_model = found;
+            return FTS_OK;
+        }
+    }
+    return result ? result : FTS_ERR_CHIP;
 }
 
 int fts_identify(struct fts_chip *chip, uint16_t *model)
@@ -284,6 +318,7 @@ int fts_identify(struct fts_chip *chip, uint16_t *model)
     if (!model_supported(found)) {
         return FTS_ERR_CHIP;
     }
+    chip->last_error = FTS_OK;
     if (model) {
         *model = found;
     }
@@ -293,48 +328,37 @@ int fts_identify(struct fts_chip *chip, uint16_t *model)
 int fts_boot_identify(struct fts_chip *chip, uint16_t *model)
 {
     const uint8_t start[1] = {FTS_CMD_START};
-    const uint8_t start_data[1] = {0xAA};
-    const uint8_t read_id[1] = {FTS_CMD_READ_ID};
-    uint8_t id[2] = {0, 0};
-    uint16_t found;
+    uint16_t found = 0;
     int result;
 
     if (!chip || !model) {
         return FTS_ERR_PARAM;
     }
-    // The application may not be running yet. Try the non-reset handshake
+    // The application may not be running yet. Try the non-reset 0x55 handshake
     // first, and if the ROM bootloader unlock window has already elapsed,
     // fall back to a hardware reset into ROM boot via fts_enter_boot().
     chip->fw_running = 0;
-    result = fts_write(chip, start, sizeof(start), start_data,
-                       sizeof(start_data));
+    result = fts_write(chip, start, sizeof(start), NULL, 0);
     if (result == FTS_OK) {
         if (chip->bus->delay_ms) {
-            chip->bus->delay_ms(chip->bus->ctx, 12);
+            chip->bus->delay_ms(chip->bus->ctx, 8);
         }
-        result = fts_read(chip, read_id, sizeof(read_id), id, sizeof(id));
+        result = read_boot_id(chip, &found);
         if (result == FTS_OK) {
-            found = (uint16_t)(((uint16_t)id[0] << 8) | id[1]);
-            if (model_supported(found)) {
-                *model = found;
-                return FTS_OK;
-            }
-            result = FTS_ERR_CHIP;
+            chip->last_error = FTS_OK;
+            *model = found;
+            return FTS_OK;
         }
     }
     if (chip->bus && chip->bus->reset) {
         result = fts_enter_boot(chip);
         if (result == FTS_OK) {
-            id[0] = 0;
-            id[1] = 0;
-            if (fts_read(chip, read_id, sizeof(read_id), id, sizeof(id)) ==
-                FTS_OK) {
-                found = (uint16_t)(((uint16_t)id[0] << 8) | id[1]);
-                if (model_supported(found)) {
-                    *model = found;
-                    return FTS_OK;
-                }
+            if (read_boot_id(chip, &found) == FTS_OK) {
+                chip->last_error = FTS_OK;
+                *model = found;
+                return FTS_OK;
             }
+            chip->last_error = FTS_OK;
             *model = FTS_MODEL_FT8719_ROM;
             return FTS_OK;
         }
@@ -346,17 +370,14 @@ int fts_enter_boot(struct fts_chip *chip)
 {
     const uint8_t start[1] = {FTS_CMD_START};
     const uint8_t start_data[1] = {0xAA};
-    const uint8_t read_id[1] = {FTS_CMD_READ_ID};
     unsigned outer;
 
     if (!chip || !chip->bus || !chip->bus->reset) {
         return FTS_ERR_PARAM;
     }
     chip->fw_running = 0;
-    // The vendor resets, waits one millisecond, releases reset, waits the
+    // The vendor resets, waits two milliseconds, releases reset, waits the
     // eight millisecond boot delay, then sends 0x55 and reads the boot id.
-    // Three reset rounds of three id reads are enough without the vendor's
-    // thirty-round worst case.
     for (outer = 0; outer < 3; ++outer) {
         unsigned attempt;
 
@@ -369,8 +390,7 @@ int fts_enter_boot(struct fts_chip *chip)
             chip->bus->delay_ms(chip->bus->ctx, 8);
         }
         for (attempt = 0; attempt < 3; ++attempt) {
-            uint8_t id[2] = {0, 0};
-            uint16_t found;
+            uint16_t found = 0;
             int result;
 
             if (attempt < 2) {
@@ -385,12 +405,8 @@ int fts_enter_boot(struct fts_chip *chip)
             if (chip->bus->delay_ms) {
                 chip->bus->delay_ms(chip->bus->ctx, 8);
             }
-            result = fts_read(chip, read_id, sizeof(read_id), id, sizeof(id));
-            if (result) {
-                continue;
-            }
-            found = (uint16_t)(((uint16_t)id[0] << 8) | id[1]);
-            if (model_supported(found)) {
+            if (read_boot_id(chip, &found) == FTS_OK) {
+                chip->last_error = FTS_OK;
                 return FTS_OK;
             }
         }
@@ -416,6 +432,7 @@ int fts_wait_ready(struct fts_chip *chip, unsigned timeout_ms)
         chip->fw_running = (int)(toggle & 1u);
         if (fts_read_app_id(chip, &model) == FTS_OK &&
             model == FTS_MODEL_FT8719) {
+            chip->last_error = FTS_OK;
             return FTS_OK;
         }
         ++toggle;
@@ -496,6 +513,31 @@ int fts_read_report(struct fts_chip *chip, uint8_t *frame, size_t len)
         return FTS_ERR_PARAM;
     }
     result = read_data(chip, frame, len);
+    // In the vendor FT8719 SPI driver (fts_read_touchdata), a touch read first
+    // issues command 0x01 (C0 A3 01 00 5A) before reading the 0x3F data
+    // package. If a direct 0x3F read did not return a touch header (0x9x),
+    // recovery marker, or CRC failure on a 0x9x frame, also try the 0x01
+    // command read.
+    if ((result == FTS_OK || result == FTS_ERR_CRC) &&
+        (frame[0] & 0xF0) != 0x90 && frame[0] != 0xEF &&
+        !(len >= 4 && frame[1] == 0xEF && frame[2] == 0xEF &&
+          frame[3] == 0xEF) &&
+        !(len >= 6 && frame[1] == 0xFF && frame[2] == 0xFF &&
+          frame[3] == 0xFF && frame[4] == 0xFF && frame[5] == 0xFF)) {
+        const uint8_t touch_cmd = 0x01u;
+        const unsigned saved_crc = chip->crc_errors;
+        int cmd_res;
+
+        if (result == FTS_ERR_CRC && chip->crc_errors) {
+            --chip->crc_errors;
+        }
+        cmd_res = fts_read(chip, &touch_cmd, 1, frame, len);
+        if (cmd_res == FTS_OK || cmd_res == FTS_ERR_CRC) {
+            result = cmd_res;
+        } else {
+            chip->crc_errors = saved_crc;
+        }
+    }
     // A controller that has fallen back to its bootloader reports 0xEF in the
     // first bytes, and sometimes the CRC is unusable at the same time. The
     // second marker is the in-cell one: an all-0xFF count and first records.
@@ -640,10 +682,8 @@ static int firmware_write_image(struct fts_chip *chip, const uint8_t *image,
         if (result) {
             return result;
         }
-        // The slow packet size is the vendor's fallback when the controller
-        // does not advertise fast download.
         if (chip->bus->delay_ms) {
-            chip->bus->delay_ms(chip->bus->ctx, 3);
+            chip->bus->delay_ms(chip->bus->ctx, 1);
         }
     }
     return FTS_OK;
@@ -746,6 +786,7 @@ int fts_firmware_download(struct fts_chip *chip, const uint8_t *image,
         }
         if (result == FTS_OK && model == FTS_MODEL_FT8719) {
             chip->fw_running = 1;
+            chip->last_error = FTS_OK;
             return FTS_OK;
         }
         result = result ? result : FTS_ERR_CHIP;

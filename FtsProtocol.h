@@ -67,7 +67,9 @@
 
 #define FTS_PRAM_BASE 0x000000
 #define FTS_APP_INFO_OFFSET 0x100
-#define FTS_FW_CHUNK (4 * 1024 - 4)
+// Sized so 1 package byte + FTS_FW_CHUNK <= 1024 (MediaTek SPI single-packet
+// hardware DMA limit MTK_SPI_PACKET_SIZE = 1024).
+#define FTS_FW_CHUNK (1024 - 4)
 #define FTS_FW_MAX (64 * 1024)
 #define FTS_FW_MIN 0x120
 #define FTS_FW_RETRIES 3

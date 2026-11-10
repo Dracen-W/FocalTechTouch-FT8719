@@ -61,8 +61,8 @@ volatile int fts_touch_last_x = -1, fts_touch_last_y = -1;
 
 namespace {
 
-// Enough for one 4092-byte firmware chunk plus its package byte and CRC tail.
-constexpr size_t kBusBytes = FTS_FW_CHUNK + 16;
+// Enough for up to a 4096-byte firmware chunk plus its package byte and CRC tail.
+constexpr size_t kBusBytes = (FTS_FW_CHUNK > 4096 ? FTS_FW_CHUNK : 4096) + 16;
 
 struct Session {
     void *board;
