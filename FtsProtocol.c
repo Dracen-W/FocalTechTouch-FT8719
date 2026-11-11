@@ -32,7 +32,7 @@ static int wait_idle(struct fts_chip *chip)
     const uint8_t idle = chip->fw_running ? FTS_STATUS_IDLE_FW
                                           : FTS_STATUS_IDLE_BOOT;
     unsigned attempt;
-    unsigned wrong_mode = 0;
+    unsigned non_busy = 0;
 
     chip->idle_polls = 0;
     for (attempt = 0; attempt < FTS_BUSY_RETRIES; ++attempt) {
@@ -46,17 +46,17 @@ static int wait_idle(struct fts_chip *chip)
             if ((chip->rx[1] & FTS_STATUS_MASK) == idle) {
                 return FTS_OK;
             }
-            // Bit 7 is the busy flag. If the controller is not busy and
-            // repeatedly reports the opposite mode (for example ROM boot idle
-            // 0x02 while probing for running firmware), stop polling early so
-            // the 8 ms post-reset bootloader window is not wasted.
+            // Bit 7 (0x80) is the hardware busy flag in the FT8719 SPI status
+            // byte. Some FT8719 revisions report 0x02 or 0x04 when idle; once
+            // bit 7 stays clear for several polls, treat the slave as idle so
+            // identification and command packages can proceed.
             if ((chip->rx[1] & 0x80u) == 0u && chip->rx[1] != 0xFFu) {
-                if (++wrong_mode >= 6u) {
+                if (++non_busy >= 4u) {
                     chip->idle_polls = attempt + 1;
-                    break;
+                    return FTS_OK;
                 }
             } else {
-                wrong_mode = 0;
+                non_busy = 0;
             }
         }
         chip->idle_polls = attempt + 1;
@@ -215,6 +215,10 @@ int fts_read(struct fts_chip *chip, const uint8_t *cmd, size_t cmdlen,
         return FTS_ERR_PARAM;
     }
     if (cmd && cmdlen) {
+        // Per vendor FT8719P focaltech_spi.c, bit 5 (0x20 DataCrcEn) in the
+        // 0xC0 command control byte is set only when application firmware is
+        // running (fw_running != 0); in ROM boot mode control is 0x80.
+        const uint8_t ctrl = chip->fw_running ? FTS_CTRL_READ : 0x80u;
         if (cmdlen + (chip->fw_running ? 2u : 0u) > FTS_COMMAND_MAX) {
             return FTS_ERR_PARAM;
         }
@@ -222,7 +226,7 @@ int fts_read(struct fts_chip *chip, const uint8_t *cmd, size_t cmdlen,
         if (result) {
             return result;
         }
-        result = send_command(chip, FTS_CTRL_READ, cmd, cmdlen, datalen,
+        result = send_command(chip, ctrl, cmd, cmdlen, datalen,
                               chip->fw_running);
         if (result) {
             return result;
@@ -273,6 +277,63 @@ static int model_supported(uint16_t model)
            model == FTS_MODEL_FT8719_PB;
 }
 
+// Reads the two-byte boot ID (0x90). Standard 1-byte {0x90} is tried first,
+// followed by the 4-byte in-cell command {0x90, 0x00, 0x00, 0x00}
+// (FTS_CMD_READ_ID_LEN_INCELL = 4 in the vendor driver for FT8719) and
+// alternate control framing (0xA0 / 0x00).
+static int read_boot_id(struct fts_chip *chip, uint16_t *model)
+{
+    const uint8_t read_id_1[1] = {FTS_CMD_READ_ID};
+    const uint8_t read_id_4[4] = {FTS_CMD_READ_ID, 0x00, 0x00, 0x00};
+    const uint8_t ctrls[2] = {FTS_CTRL_READ, 0x00u};
+    uint8_t id[2] = {0, 0};
+    uint16_t found = 0;
+    unsigned i;
+    int result;
+
+    result = fts_read(chip, read_id_1, sizeof(read_id_1), id, sizeof(id));
+    if (result == FTS_OK) {
+        found = (uint16_t)(((uint16_t)id[0] << 8) | id[1]);
+        if (model_supported(found)) {
+            *model = found;
+            return FTS_OK;
+        }
+    }
+    if (fts_read(chip, read_id_4, sizeof(read_id_4), id, sizeof(id)) == FTS_OK) {
+        found = (uint16_t)(((uint16_t)id[0] << 8) | id[1]);
+        if (model_supported(found)) {
+            *model = found;
+            return FTS_OK;
+        }
+    }
+    for (i = 0; i < 2u; ++i) {
+        if (wait_idle(chip) == FTS_OK &&
+            send_command(chip, ctrls[i], read_id_1, sizeof(read_id_1),
+                         sizeof(id), 0) == FTS_OK &&
+            wait_idle(chip) == FTS_OK &&
+            read_data(chip, id, sizeof(id)) == FTS_OK) {
+            found = (uint16_t)(((uint16_t)id[0] << 8) | id[1]);
+            if (model_supported(found)) {
+                *model = found;
+                return FTS_OK;
+            }
+        }
+        if (wait_idle(chip) == FTS_OK &&
+            send_command(chip, ctrls[i], read_id_4, sizeof(read_id_4),
+                         sizeof(id), 0) == FTS_OK &&
+            wait_idle(chip) == FTS_OK &&
+            read_data(chip, id, sizeof(id)) == FTS_OK) {
+            found = (uint16_t)(((uint16_t)id[0] << 8) | id[1]);
+            if (model_supported(found)) {
+                *model = found;
+                return FTS_OK;
+            }
+        }
+    }
+    *model = found;
+    return result ? result : FTS_ERR_CHIP;
+}
+
 int fts_identify(struct fts_chip *chip, uint16_t *model)
 {
     uint16_t found = 0;
@@ -293,45 +354,36 @@ int fts_identify(struct fts_chip *chip, uint16_t *model)
 int fts_boot_identify(struct fts_chip *chip, uint16_t *model)
 {
     const uint8_t start[1] = {FTS_CMD_START};
-    const uint8_t read_id[1] = {FTS_CMD_READ_ID};
-    uint8_t id[2] = {0, 0};
-    uint16_t found;
+    uint16_t found = 0;
     int result;
 
     if (!chip || !model) {
         return FTS_ERR_PARAM;
     }
-    // The application may not be running yet. Try the non-reset handshake
-    // first, and if the ROM bootloader unlock window has already elapsed,
-    // fall back to a hardware reset into ROM boot via fts_enter_boot().
+    // Over SPI, the ROM bootloader unlock command is a single-byte 0x55
+    // command package (0xC0 0x01 0x55) without a separate 0x3F 0xAA data
+    // package. Try unlocking directly first; if the post-reset window has
+    // already elapsed, fall back to a hardware reset via fts_enter_boot().
     chip->fw_running = 0;
     result = fts_write(chip, start, sizeof(start), NULL, 0);
     if (result == FTS_OK) {
         if (chip->bus->delay_ms) {
             chip->bus->delay_ms(chip->bus->ctx, 12);
         }
-        result = fts_read(chip, read_id, sizeof(read_id), id, sizeof(id));
-        if (result == FTS_OK) {
-            found = (uint16_t)(((uint16_t)id[0] << 8) | id[1]);
-            if (model_supported(found)) {
-                *model = found;
-                return FTS_OK;
-            }
-            result = FTS_ERR_CHIP;
+        result = read_boot_id(chip, &found);
+        if (result == FTS_OK && model_supported(found)) {
+            *model = found;
+            return FTS_OK;
         }
+        result = FTS_ERR_CHIP;
     }
     if (chip->bus && chip->bus->reset) {
         result = fts_enter_boot(chip);
         if (result == FTS_OK) {
-            id[0] = 0;
-            id[1] = 0;
-            if (fts_read(chip, read_id, sizeof(read_id), id, sizeof(id)) ==
-                FTS_OK) {
-                found = (uint16_t)(((uint16_t)id[0] << 8) | id[1]);
-                if (model_supported(found)) {
-                    *model = found;
-                    return FTS_OK;
-                }
+            if (read_boot_id(chip, &found) == FTS_OK &&
+                model_supported(found)) {
+                *model = found;
+                return FTS_OK;
             }
             *model = FTS_MODEL_FT8719_ROM;
             return FTS_OK;
@@ -342,21 +394,18 @@ int fts_boot_identify(struct fts_chip *chip, uint16_t *model)
 
 int fts_enter_boot(struct fts_chip *chip)
 {
-    const uint8_t start[1] = {FTS_CMD_START};
-    const uint8_t start_data[1] = {0xAA};
-    const uint8_t read_id[1] = {FTS_CMD_READ_ID};
+    const uint8_t start_1[1] = {FTS_CMD_START};
+    const uint8_t start_2[2] = {FTS_CMD_START, 0xAA};
     unsigned outer;
 
     if (!chip || !chip->bus || !chip->bus->reset) {
         return FTS_ERR_PARAM;
     }
     chip->fw_running = 0;
-    // The vendor resets, waits one millisecond, releases reset, waits the
-    // eight millisecond boot delay, then sends 0x55 and reads the boot id.
-    // Three reset rounds of three id reads are enough without the vendor's
-    // thirty-round worst case.
+    // The vendor resets, waits 2 ms, releases reset, waits the 8-12 ms boot
+    // delay, then sends 0x55 (or 0x55 0xAA in the command package) and reads
+    // the boot ID.
     for (outer = 0; outer < 3; ++outer) {
-        static const unsigned kPostResetDelayMs[3] = {10u, 12u, 8u};
         unsigned attempt;
 
         chip->bus->reset(chip->bus->ctx, 1);
@@ -365,18 +414,16 @@ int fts_enter_boot(struct fts_chip *chip)
         }
         chip->bus->reset(chip->bus->ctx, 0);
         if (chip->bus->delay_ms) {
-            chip->bus->delay_ms(chip->bus->ctx, kPostResetDelayMs[outer % 3u]);
+            chip->bus->delay_ms(chip->bus->ctx, 8 + outer * 2);
         }
         for (attempt = 0; attempt < 3; ++attempt) {
-            uint8_t id[2] = {0, 0};
-            uint16_t found;
+            uint16_t found = 0;
             int result;
 
             if (attempt < 2) {
-                result = fts_write(chip, start, sizeof(start), NULL, 0);
+                result = fts_write(chip, start_1, sizeof(start_1), NULL, 0);
             } else {
-                result = fts_write(chip, start, sizeof(start), start_data,
-                                   sizeof(start_data));
+                result = fts_write(chip, start_2, sizeof(start_2), NULL, 0);
             }
             if (result) {
                 continue;
@@ -384,12 +431,15 @@ int fts_enter_boot(struct fts_chip *chip)
             if (chip->bus->delay_ms) {
                 chip->bus->delay_ms(chip->bus->ctx, 8);
             }
-            result = fts_read(chip, read_id, sizeof(read_id), id, sizeof(id));
-            if (result) {
-                continue;
+            if (read_boot_id(chip, &found) == FTS_OK &&
+                model_supported(found)) {
+                return FTS_OK;
             }
-            found = (uint16_t)(((uint16_t)id[0] << 8) | id[1]);
-            if (model_supported(found)) {
+            // On merlinx FT8719 hardware, the ROM bootloader shifts out status
+            // 0x02 immediately after accepting 0x55 (0xC0 0x01 0x55). If all ID
+            // framings still echoed status 0x02 on the final round, allow PRAM
+            // firmware download to proceed rather than aborting at Stage 1.
+            if (outer == 2 && attempt == 2 && chip->last_status == 0x02u) {
                 return FTS_OK;
             }
         }
