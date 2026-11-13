@@ -363,23 +363,16 @@ void touchThread(void *parameter, wait_result_t)
 
         mark(*session, 1);
         {
-            int result = FTS_ERR_CHIP;
-            unsigned attempt;
+            int result;
 
-            // The controller boots into its application if already loaded, or
-            // sits in its ROM bootloader on cold boot. Retry up to three times
-            // so a transient power or clock settling glitch does not abort
-            // bring-up permanently.
-            for (attempt = 0; attempt < 3; ++attempt) {
-                session->chip.fw_running = 1;
-                result = fts_identify(&session->chip, &session->model);
-                if (result != FTS_OK) {
-                    result = fts_boot_identify(&session->chip, &session->model);
-                }
-                if (result == FTS_OK) {
-                    break;
-                }
-                IOSleep(40);
+            // The controller boots into its application, so the first read
+            // uses the application framing (the two-byte length field). A
+            // controller left in its bootloader falls back to the 0x55/0xAA
+            // handshake.
+            session->chip.fw_running = 1;
+            result = fts_identify(&session->chip, &session->model);
+            if (result != FTS_OK) {
+                result = fts_boot_identify(&session->chip, &session->model);
             }
             if (result != FTS_OK) {
                 fail(1, result);
@@ -504,7 +497,8 @@ extern "C" int fts_touch_probe(void *board)
 }
 
 // The board calls these from a thread, not from an interrupt. They are valid
-// once the frame loop has started (stage 3). Before that they are no-ops.
+// once the frame loop has started (stage 3). Before that the probe may still be
+// initialising or tearing down its session, so both calls are no-ops.
 extern "C" int fts_touch_suspend(void)
 {
     Session *session;

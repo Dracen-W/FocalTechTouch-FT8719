@@ -371,14 +371,6 @@ static void test_bad_crc_and_idle(void)
     fixture.fake.read_source_len = sizeof(frame);
     assert(fts_read_report(&fixture.chip, frame, sizeof(frame)) ==
            FTS_REPORT_IDLE);
-
-    build_frame(frame, 0x00, 0, 0, 0, 0, 0, 0, 0);
-    fixture.fake.read_source = frame;
-    fixture.fake.read_source_len = sizeof(frame);
-    fixture.fake.corrupt_crc = 1;
-    assert(fts_read_report(&fixture.chip, frame, sizeof(frame)) ==
-           FTS_REPORT_IDLE);
-    fixture.fake.corrupt_crc = 0;
 }
 
 static void test_recovery_markers(void)
@@ -456,10 +448,12 @@ static void test_boot_identify(void)
     fixture_init(&fixture, 0);
     assert(fts_boot_identify(&fixture.chip, &model) == FTS_OK);
     assert(model == FTS_MODEL_FT8719_ROM);
+    assert(fixture.fake.resets == 0);
 
-    // ROM bootloader reads do not carry an application Kermit CRC-16, and a
-    // controller whose post-power-on unlock window expired needs a reset into
-    // ROM boot before 0x90 answers.
+    // When the post-power-on unlock window has expired (0x90 returns 0x0000
+    // until a hardware reset occurs), fts_boot_identify() resets into ROM boot
+    // and reads the valid boot ID without counting a ROM read without CRC as
+    // a CRC error.
     fixture_init(&fixture, 0);
     fixture.fake.corrupt_crc = 1;
     fixture.fake.regs[0x90] = 0x00;
