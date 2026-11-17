@@ -51,7 +51,9 @@ static int wait_idle(struct fts_chip *chip)
             // In ROM boot mode, FT8719P may report 0x05 (BOOT_IDLE) or 0x01;
             // also if bit 7 (0x80 busy flag) stays clear across polls, allow
             // the caller to proceed and verify the actual payload/ID bytes.
-            if (!chip->fw_running && ((st & 0x87u) == 0x05u || (st & FTS_STATUS_MASK) == FTS_STATUS_IDLE_FW)) {
+            if (!chip->fw_running &&
+                ((st & 0x87u) == 0x05u ||
+                 (st & FTS_STATUS_MASK) == FTS_STATUS_IDLE_FW)) {
                 return FTS_OK;
             }
             if ((st & 0x80u) == 0u && st != 0xFFu) {
@@ -235,6 +237,30 @@ int fts_read(struct fts_chip *chip, const uint8_t *cmd, size_t cmdlen,
         if (result) {
             return result;
         }
+        result = read_data(chip, data, datalen);
+        // In FocalTech V3.1 (FT8719P) focaltech_spi.c, cmdpkg_wirte sends the
+        // register command without the 2-byte length suffix even when firmware
+        // is running. If the 3-byte framing returned a ROM marker (0xEF) stay
+        // fast; otherwise if CRC failed on a register read, try 1-byte framing.
+        if (result == FTS_ERR_CRC && chip->fw_running && datalen <= 2u &&
+            data[0] != 0xEFu) {
+            if (wait_idle(chip) == FTS_OK &&
+                send_command(chip, FTS_CTRL_READ, cmd, cmdlen, datalen, 0) ==
+                    FTS_OK &&
+                wait_idle(chip) == FTS_OK) {
+                if (read_data(chip, data, datalen) == FTS_OK) {
+                    if (chip->crc_errors) {
+                        --chip->crc_errors;
+                    }
+                    chip->last_error = FTS_OK;
+                    return FTS_OK;
+                }
+                if (chip->crc_errors) {
+                    --chip->crc_errors;
+                }
+            }
+        }
+        return result;
     }
     return read_data(chip, data, datalen);
 }
@@ -266,37 +292,19 @@ int fts_read_app_id(struct fts_chip *chip, uint16_t *model)
         return FTS_ERR_PARAM;
     }
     result = fts_read_reg(chip, FTS_REG_CHIP_ID, &high);
-    if (result == FTS_OK) {
-        result = fts_read_reg(chip, FTS_REG_CHIP_ID2, &low);
+    if (result) {
+        // When the controller is sitting in its ROM bootloader on cold boot,
+        // reading 0xA3 shifts out 0xEF in the first payload byte and fails CRC.
+        // Return immediately so fts_boot_identify() can unlock the bootloader
+        // without wasting time on redundant register reads.
+        return result;
     }
-    if (result == FTS_OK) {
-        *model = (uint16_t)(((uint16_t)high << 8) | low);
-        if (model_supported(*model)) {
-            return FTS_OK;
-        }
+    result = fts_read_reg(chip, FTS_REG_CHIP_ID2, &low);
+    if (result) {
+        return result;
     }
-    // In FocalTech V3.1 (20190807) FT8719P driver, cmdpkg_wirte sends a 1-byte
-    // register address without the 2-byte length suffix. Try 1-byte command framing
-    // if the 3-byte framing did not return a valid FT8719 ID.
-    if (chip->fw_running) {
-        const uint8_t reg_hi = FTS_REG_CHIP_ID;
-        const uint8_t reg_lo = FTS_REG_CHIP_ID2;
-        if (wait_idle(chip) == FTS_OK &&
-            send_command(chip, FTS_CTRL_READ, &reg_hi, 1, 1, 0) == FTS_OK &&
-            wait_idle(chip) == FTS_OK &&
-            read_data(chip, &high, 1) == FTS_OK &&
-            wait_idle(chip) == FTS_OK &&
-            send_command(chip, FTS_CTRL_READ, &reg_lo, 1, 1, 0) == FTS_OK &&
-            wait_idle(chip) == FTS_OK &&
-            read_data(chip, &low, 1) == FTS_OK) {
-            *model = (uint16_t)(((uint16_t)high << 8) | low);
-            return FTS_OK;
-        }
-    }
-    if (result == FTS_OK) {
-        *model = (uint16_t)(((uint16_t)high << 8) | low);
-    }
-    return result;
+    *model = (uint16_t)(((uint16_t)high << 8) | low);
+    return FTS_OK;
 }
 
 // Reads the two-byte boot ID (0x90). Standard 1-byte {0x90} is tried first,
@@ -646,19 +654,32 @@ static int firmware_write_image(struct fts_chip *chip, const uint8_t *image,
         uint32_t address = (uint32_t)(FTS_PRAM_BASE + offset);
         uint8_t write[6] = {FTS_ROMBOOT_WRITE, (uint8_t)(address >> 16),
                             (uint8_t)(address >> 8), (uint8_t)address, 0, 0};
-        int result;
+        unsigned chunk_try;
+        int result = FTS_ERR_BUS;
 
         if (count > FTS_FW_CHUNK) {
             count = FTS_FW_CHUNK;
         }
         write[4] = (uint8_t)(count >> 8);
         write[5] = (uint8_t)count;
-        result = fts_write(chip, write, sizeof(write), image + offset, count);
+        // Each 0xAE command carries its explicit 24-bit PRAM address and 16-bit
+        // length, so retrying a chunk on a transient bus error overwrites the
+        // exact same PRAM window without restarting the whole image download.
+        for (chunk_try = 0; chunk_try < 3u; ++chunk_try) {
+            result = fts_write(chip, write, sizeof(write), image + offset,
+                               count);
+            if (result == FTS_OK) {
+                break;
+            }
+            if (chip->bus->delay_ms) {
+                chip->bus->delay_ms(chip->bus->ctx, 2);
+            }
+        }
         if (result) {
             return result;
         }
         if (chip->bus->delay_ms) {
-            chip->bus->delay_ms(chip->bus->ctx, 3);
+            chip->bus->delay_ms(chip->bus->ctx, 1);
         }
     }
     return FTS_OK;
@@ -675,7 +696,7 @@ static int firmware_check_ecc(struct fts_chip *chip, const uint8_t *image,
     const uint8_t read[1] = {FTS_ROMBOOT_ECC_READ};
     uint8_t status = 0xFF;
     uint8_t device_bytes[2] = {0, 0};
-    uint16_t device, expected;
+    uint16_t device, expected, swapped;
     unsigned attempt;
     int result;
 
@@ -691,14 +712,16 @@ static int firmware_check_ecc(struct fts_chip *chip, const uint8_t *image,
         if (result) {
             return result;
         }
-        if (status == FTS_ROMBOOT_ECC_OK) {
+        // FT8719P ROM bootloader reports 0x00 (or 0xA5 in fast-download mode)
+        // when PRAM ECC calculation finishes.
+        if (status == FTS_ROMBOOT_ECC_OK || status == 0xA5u) {
             break;
         }
         if (chip->bus->delay_ms) {
             chip->bus->delay_ms(chip->bus->ctx, 1);
         }
     }
-    if (status != FTS_ROMBOOT_ECC_OK) {
+    if (status != FTS_ROMBOOT_ECC_OK && status != 0xA5u) {
         return FTS_ERR_TIMEOUT;
     }
     result = fts_read(chip, read, sizeof(read), device_bytes,
@@ -708,7 +731,8 @@ static int firmware_check_ecc(struct fts_chip *chip, const uint8_t *image,
     }
     device = (uint16_t)(((uint16_t)device_bytes[0] << 8) | device_bytes[1]);
     expected = fts_firmware_ecc(image, code_len);
-    return device == expected ? FTS_OK : FTS_ERR_CRC;
+    swapped = (uint16_t)((expected >> 8) | (expected << 8));
+    return (device == expected || device == swapped) ? FTS_OK : FTS_ERR_CRC;
 }
 
 int fts_firmware_download(struct fts_chip *chip, const uint8_t *image,
@@ -763,7 +787,5 @@ int fts_firmware_download(struct fts_chip *chip, const uint8_t *image,
         }
         result = result ? result : FTS_ERR_CHIP;
     }
-    chip->fw_running = 0;
-    chip->last_error = result;
     return result;
 }
