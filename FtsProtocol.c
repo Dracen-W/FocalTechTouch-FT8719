@@ -696,42 +696,57 @@ static int firmware_check_ecc(struct fts_chip *chip, const uint8_t *image,
     const uint8_t read[1] = {FTS_ROMBOOT_ECC_READ};
     uint8_t status = 0xFF;
     uint8_t device_bytes[2] = {0, 0};
-    uint16_t device, expected, swapped;
+    uint16_t device = 0, expected, swapped;
     unsigned attempt;
+    int saw_ready = 0;
     int result;
+
+    expected = fts_firmware_ecc(image, code_len);
+    swapped = (uint16_t)((expected >> 8) | (expected << 8));
 
     result = fts_write(chip, command, sizeof(command), NULL, 0);
     if (result) {
         return result;
     }
+    // Per FocalTech FT8719P focaltech_flash.c (fts_pram_ecc_cal_algo), the
+    // ROM bootloader holds 0xCE at 0x00 while busy computing CRC-16 over the
+    // 61,732-byte PRAM image and sets 0xCE = 0xA5 (FTS_ROMBOOT_CMD_ECC_FINISH_OK_A5)
+    // once finished (whereas older revisions report 0x00 when finished).
+    // Wait 15 ms up front, then whenever 0xCE reads 0xA5 or 0x00, read 0xCD:
+    // if 0xCD matches expected, return FTS_OK immediately; if 0xCE is still
+    // 0x00 (busy calculating) and 0xCD has not latched the final CRC yet,
+    // keep polling instead of breaking prematurely on attempt 0.
     if (chip->bus->delay_ms) {
-        chip->bus->delay_ms(chip->bus->ctx, 2);
+        chip->bus->delay_ms(chip->bus->ctx, 15);
     }
     for (attempt = 0; attempt < FTS_ECC_RETRIES; ++attempt) {
         result = fts_read(chip, finish, sizeof(finish), &status, 1);
         if (result) {
             return result;
         }
-        // FT8719P ROM bootloader reports 0x00 (or 0xA5 in fast-download mode)
-        // when PRAM ECC calculation finishes.
-        if (status == FTS_ROMBOOT_ECC_OK || status == 0xA5u) {
-            break;
+        if (status == 0xA5u || status == FTS_ROMBOOT_ECC_OK) {
+            saw_ready = 1;
+            result = fts_read(chip, read, sizeof(read), device_bytes,
+                              sizeof(device_bytes));
+            if (result) {
+                return result;
+            }
+            device = (uint16_t)(((uint16_t)device_bytes[0] << 8) |
+                                device_bytes[1]);
+            if (device == expected || device == swapped) {
+                return FTS_OK;
+            }
+            if (status == 0xA5u && attempt >= 4u) {
+                break;
+            }
         }
         if (chip->bus->delay_ms) {
-            chip->bus->delay_ms(chip->bus->ctx, 1);
+            chip->bus->delay_ms(chip->bus->ctx, 2);
         }
     }
-    if (status != FTS_ROMBOOT_ECC_OK && status != 0xA5u) {
+    if (!saw_ready) {
         return FTS_ERR_TIMEOUT;
     }
-    result = fts_read(chip, read, sizeof(read), device_bytes,
-                      sizeof(device_bytes));
-    if (result) {
-        return result;
-    }
-    device = (uint16_t)(((uint16_t)device_bytes[0] << 8) | device_bytes[1]);
-    expected = fts_firmware_ecc(image, code_len);
-    swapped = (uint16_t)((expected >> 8) | (expected << 8));
     return (device == expected || device == swapped) ? FTS_OK : FTS_ERR_CRC;
 }
 
