@@ -644,12 +644,21 @@ uint16_t fts_firmware_ecc(const uint8_t *data, size_t len)
     return ecc;
 }
 
+// Writes the firmware image to PRAM using 0xAE (FTS_ROMBOOT_WRITE).
+// - Attempt 0 uses 28-byte chunks (1 package byte + 28 payload bytes = 8 words
+//   in the 32-byte MediaTek SPI0 hardware FIFO), so every 0x3F data transfer
+//   completes in a single 7-word RESUME segment with lastSeg=true and a full
+//   SPI_CMD_RST after CS rises (zero PAUSED->PAUSED transitions).
+// - Attempt 1 uses FTS_FW_CHUNK (4092 bytes) and Attempt 2 uses 128 bytes.
 static int firmware_write_image(struct fts_chip *chip, const uint8_t *image,
-                                size_t code_len)
+                                size_t code_len, unsigned attempt)
 {
+    const size_t chunk_max = (attempt == 0u)
+        ? 28u
+        : ((attempt == 1u) ? (size_t)FTS_FW_CHUNK : 128u);
     size_t offset;
 
-    for (offset = 0; offset < code_len; offset += FTS_FW_CHUNK) {
+    for (offset = 0; offset < code_len; offset += chunk_max) {
         size_t count = code_len - offset;
         uint32_t address = (uint32_t)(FTS_PRAM_BASE + offset);
         uint8_t write[6] = {FTS_ROMBOOT_WRITE, (uint8_t)(address >> 16),
@@ -657,14 +666,11 @@ static int firmware_write_image(struct fts_chip *chip, const uint8_t *image,
         unsigned chunk_try;
         int result = FTS_ERR_BUS;
 
-        if (count > FTS_FW_CHUNK) {
-            count = FTS_FW_CHUNK;
+        if (count > chunk_max) {
+            count = chunk_max;
         }
         write[4] = (uint8_t)(count >> 8);
         write[5] = (uint8_t)count;
-        // Each 0xAE command carries its explicit 24-bit PRAM address and 16-bit
-        // length, so retrying a chunk on a transient bus error overwrites the
-        // exact same PRAM window without restarting the whole image download.
         for (chunk_try = 0; chunk_try < 3u; ++chunk_try) {
             result = fts_write(chip, write, sizeof(write), image + offset,
                                count);
@@ -677,9 +683,6 @@ static int firmware_write_image(struct fts_chip *chip, const uint8_t *image,
         }
         if (result) {
             return result;
-        }
-        if (chip->bus->delay_ms) {
-            chip->bus->delay_ms(chip->bus->ctx, 1);
         }
     }
     return FTS_OK;
@@ -736,7 +739,7 @@ static int firmware_check_ecc(struct fts_chip *chip, const uint8_t *image,
             if (device == expected || device == swapped) {
                 return FTS_OK;
             }
-            if (status == 0xA5u && attempt >= 4u) {
+            if (attempt >= 4u) {
                 break;
             }
         }
@@ -773,7 +776,7 @@ int fts_firmware_download(struct fts_chip *chip, const uint8_t *image,
         if (result) {
             continue;
         }
-        result = firmware_write_image(chip, image, code_len);
+        result = firmware_write_image(chip, image, code_len, attempt);
         if (result) {
             continue;
         }
