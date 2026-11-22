@@ -32,7 +32,10 @@ void fts_hid_publish(const struct fts_core_report *report)
         return;
     }
     seq = __atomic_load_n(&fts_touch_seq, __ATOMIC_RELAXED);
-    __atomic_store_n(&fts_touch_seq, seq + 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&fts_touch_seq, seq + 1, __ATOMIC_RELAXED);
+    // Ensure the odd sequence number is visible before any payload store on
+    // weakly-ordered architectures (ARM64).
+    __atomic_thread_fence(__ATOMIC_RELEASE);
 
     __atomic_store_n(&fts_touch_count, report->count, __ATOMIC_RELAXED);
     __atomic_store_n(&fts_touch_x_max, report->x_max, __ATOMIC_RELAXED);
@@ -95,7 +98,10 @@ int fts_hid_read(struct fts_hid_state *state)
             state->points[i].tip = (uint8_t)__atomic_load_n(
                 &fts_touch_tips[i], __ATOMIC_RELAXED);
         }
-        after = __atomic_load_n(&fts_touch_seq, __ATOMIC_ACQUIRE);
+        // Prevent payload loads from being reordered after the closing seq load
+        // on weakly-ordered architectures (ARM64).
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        after = __atomic_load_n(&fts_touch_seq, __ATOMIC_RELAXED);
         if (before == after) {
             return FTS_OK;
         }

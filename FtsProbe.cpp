@@ -4,6 +4,7 @@
 // Boot arguments:
 //   fts-touch=<1..3>  1 identify, 2 firmware if needed + version, 3 frame loop
 //   fts-touch-poll=1  poll instead of waiting on the board interrupt
+//   fts-touch-interval-ms=<N>  minimum active report interval in ms (default 8, ~125 Hz; 0 = off)
 //   fts-touch-swap=1  override the board axis swap
 //   fts-touch-invert-x=1, fts-touch-invert-y=1  override the board inversion
 //
@@ -13,6 +14,7 @@
 // vendor firmware image.
 #include <IOKit/IOService.h>
 #include <IOKit/IOLib.h>
+#include <kern/clock.h>
 #include <kern/thread.h>
 #include <pexpert/pexpert.h>
 #include <libkern/libkern.h>
@@ -63,6 +65,14 @@ namespace {
 
 // Enough for one 4092-byte firmware chunk plus its package byte and CRC tail.
 constexpr size_t kBusBytes = FTS_FW_CHUNK + 16;
+// Default active touch pacing: 8 ms (~125 Hz) matches standard smartphone touch
+// controllers and prevents level-triggered / rapid-reassert IRQ storms from
+// flooding SPI and backboardd's HID queue at >1,400 Hz.
+constexpr unsigned kDefaultIntervalMs = 8;
+constexpr unsigned kMaxIntervalMs = 50;
+// When contacts are held completely stationary, republish at most every 32 ms
+// (~30 Hz) while still delivering any coordinate or down/up change immediately.
+constexpr uint64_t kStationaryHeartbeatNs = 32ULL * 1000000ULL;
 
 struct Session {
     void *board;
@@ -86,6 +96,33 @@ volatile int gSuspendedPublished;
 volatile int gSuspendedAck;
 unsigned gStage;
 int gPoll;
+unsigned gIntervalMs = kDefaultIntervalMs;
+
+uint64_t nowNs(void)
+{
+    uint64_t ticks = 0;
+    uint64_t ns = 0;
+
+    clock_get_uptime(&ticks);
+    absolutetime_to_nanoseconds(ticks, &ns);
+    return ns;
+}
+
+bool sameReport(const struct fts_core_report &a, const struct fts_core_report &b)
+{
+    if (a.count != b.count || a.active != b.active) {
+        return false;
+    }
+    for (unsigned i = 0; i < a.count; ++i) {
+        if (a.points[i].id != b.points[i].id ||
+            a.points[i].active != b.points[i].active ||
+            a.points[i].x != b.points[i].x ||
+            a.points[i].y != b.points[i].y) {
+            return false;
+        }
+    }
+    return true;
+}
 
 int busXfer(void *context, const uint8_t *tx, uint8_t *rx, size_t len,
             unsigned first_delay_us)
@@ -230,7 +267,15 @@ int recoverChip(Session &session)
 
 void frameLoop(Session &session)
 {
+    const uint64_t intervalNs =
+        static_cast<uint64_t>(gIntervalMs) * 1000000ULL;
+    struct fts_core_report lastPublished;
+    bool hasLastPublished = false;
+    uint64_t lastSampleNs = 0;
+    uint64_t lastPublishNs = 0;
     unsigned lastRows = 0;
+
+    bzero(&lastPublished, sizeof(lastPublished));
 
     for (;;) {
         struct fts_core_report report;
@@ -240,6 +285,7 @@ void frameLoop(Session &session)
         if (__atomic_load_n(&gSuspended, __ATOMIC_ACQUIRE)) {
             if (!__atomic_load_n(&gSuspendedPublished, __ATOMIC_RELAXED)) {
                 releaseAll(session);
+                hasLastPublished = false;
                 __atomic_store_n(&gSuspendedPublished, 1, __ATOMIC_RELEASE);
                 __atomic_store_n(&gSuspendedAck, 1, __ATOMIC_RELEASE);
             }
@@ -247,6 +293,22 @@ void frameLoop(Session &session)
             continue;
         }
         __atomic_store_n(&gSuspendedPublished, 0, __ATOMIC_RELAXED);
+
+        // Pace active touch sampling to ~125 Hz (gIntervalMs) so a level-held
+        // or rapid-reasserting INT line cannot spin SPI and flood HID at >1 kHz.
+        // When no contact is active, skip pre-sleep so touch-down wakes with
+        // zero added latency.
+        if (intervalNs != 0 && session.core.active != 0 && lastSampleNs != 0) {
+            const uint64_t now = nowNs();
+            if (now < lastSampleNs + intervalNs) {
+                const uint64_t remNs = (lastSampleNs + intervalNs) - now;
+                const unsigned remMs =
+                    static_cast<unsigned>((remNs + 999999ULL) / 1000000ULL);
+                if (remMs > 0) {
+                    IOSleep(remMs);
+                }
+            }
+        }
 
         if (!gPoll && &fts_board_irq_wait) {
             int wait = fts_board_irq_wait(session.board, 100);
@@ -261,9 +323,10 @@ void frameLoop(Session &session)
                 continue;
             }
         } else {
-            IOSleep(10);
+            IOSleep(gIntervalMs ? gIntervalMs : 10);
         }
 
+        lastSampleNs = nowNs();
         kind = fts_read_report(&session.chip, session.frame,
                                FTS_TOUCH_FRAME_LEN);
         session.last_rc = kind;
@@ -273,6 +336,7 @@ void frameLoop(Session &session)
             fts_touch_recover = session.recover;
             session.consecutive_errors = 0;
             releaseAll(session);
+            hasLastPublished = false;
             if (recoverChip(session) != FTS_OK) {
                 ++session.bad;
                 fts_touch_bad = session.bad;
@@ -284,12 +348,15 @@ void frameLoop(Session &session)
             ++session.bad;
             fts_touch_bad = session.bad;
             // A single CRC or bus error is normal under load. Sixteen in a row
-            // mean the controller state is gone.
+            // mean the controller state is gone. Back off briefly so a bus
+            // glitch cannot tight-spin the thread.
             if (++session.consecutive_errors >= 16) {
                 session.consecutive_errors = 0;
                 if (recoverChip(session) != FTS_OK) {
                     IOSleep(20);
                 }
+            } else {
+                IOSleep(5);
             }
             continue;
         }
@@ -302,6 +369,13 @@ void frameLoop(Session &session)
             if (fts_core_process(&session.core, nullptr, 0, &report) >= 0 &&
                 (had || report.count)) {
                 publish(report);
+                lastPublishNs = lastSampleNs;
+                hasLastPublished = false;
+            }
+            // Prevent a stuck/spurious level IRQ from tight-spinning on idle
+            // reports.
+            if (!gPoll && gIntervalMs > 0) {
+                IOSleep(gIntervalMs);
             }
             continue;
         }
@@ -317,7 +391,19 @@ void frameLoop(Session &session)
         }
         if (fts_core_process(&session.core, session.points, count,
                              &report) >= 0) {
-            publish(report);
+            const bool transition = (report.down != 0 || report.up != 0);
+            const bool unchanged =
+                hasLastPublished && !transition &&
+                sameReport(report, lastPublished);
+            const bool heartbeatDue =
+                (lastSampleNs - lastPublishNs) >= kStationaryHeartbeatNs;
+
+            if (!unchanged || heartbeatDue) {
+                publish(report);
+                lastPublished = report;
+                hasLastPublished = (report.active != 0);
+                lastPublishNs = lastSampleNs;
+            }
         }
         fts_touch_frames = fts_touch_frames + 1;
         if (session.reads - lastRows >= 64) {
@@ -475,6 +561,7 @@ extern "C" int fts_touch_probe(void *board)
 {
     unsigned stage = 0;
     unsigned poll = 0;
+    unsigned intervalMs = kDefaultIntervalMs;
     thread_t thread = nullptr;
 
     if (!PE_parse_boot_argn("fts-touch", &stage, sizeof(stage)) || stage < 1 ||
@@ -485,7 +572,14 @@ extern "C" int fts_touch_probe(void *board)
         stage = 3;
     }
     PE_parse_boot_argn("fts-touch-poll", &poll, sizeof(poll));
+    if (PE_parse_boot_argn("fts-touch-interval-ms", &intervalMs,
+                           sizeof(intervalMs))) {
+        if (intervalMs > kMaxIntervalMs) {
+            intervalMs = kMaxIntervalMs;
+        }
+    }
     gPoll = poll != 0;
+    gIntervalMs = intervalMs;
     gStage = stage;
     fts_touch_stage_req = stage;
     if (kernel_thread_start(touchThread, board, &thread) == KERN_SUCCESS) {
