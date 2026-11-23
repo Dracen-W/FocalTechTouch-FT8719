@@ -1,52 +1,72 @@
 // SPDX-License-Identifier: MIT
 // merlinx (Redmi Note 9 4G, MT6768) board facts for the FT8719.
-//
-// Every value names its source. The active touch node is the Novatek-named
-// node because merlin.dts shares one bus node between the two panels:
-//
-//   &spi0 {
-//       novatek@0 {
-//           compatible = "novatek,NVT-ts-spi","focaltech,fts";
-//           reg = <0>;
-//           spi-max-frequency = <8000000>;
-//           novatek,reset-gpio = <&pio 92 0x00>;
-//           novatek,irq-gpio = <&pio 1 0x2001>;
-//       };
-//   };
-//
-// The separate focaltech_spi@1 node in the same file is commented out, so the
-// FT8719 sits on SPI0 chip select 0. The panel geometry is in the &touch node:
-// tpd-resolution = <1080 2340> and tpd-max-touch-num = <10>.
+// All board defaults may be overridden via CONFIG_XNU_DW_FOCALTECH_* at build time.
 #ifndef FTS_BOARD_H
 #define FTS_BOARD_H
 
 #include "FtsTouchCore.h"
 
-// merlin.dts &spi0: spi-max-frequency = <8000000>; the comment says this is
-// the FT8719 limit. Node reg = <0> selects chip select 0.
+#ifdef CONFIG_XNU_DW_FOCALTECH_SPI_HZ
+#define FTS_BOARD_SPI_HZ ((unsigned)(CONFIG_XNU_DW_FOCALTECH_SPI_HZ))
+#else
 #define FTS_BOARD_SPI_HZ 8000000u
-#define FTS_BOARD_SPI_CS 0
+#endif
 
-// merlin.dts novatek,reset-gpio = <&pio 92 0x00>: GPIO 92, active low.
+#ifdef CONFIG_XNU_DW_FOCALTECH_SPI_CS
+#define FTS_BOARD_SPI_CS (CONFIG_XNU_DW_FOCALTECH_SPI_CS)
+#else
+#define FTS_BOARD_SPI_CS 0
+#endif
+
+#ifdef CONFIG_XNU_DW_FOCALTECH_RESET_GPIO
+#define FTS_BOARD_RESET_GPIO (CONFIG_XNU_DW_FOCALTECH_RESET_GPIO)
+#else
 #define FTS_BOARD_RESET_GPIO 92
+#endif
 #define FTS_BOARD_RESET_ACTIVE_LOW 1
 
-// merlin.dts novatek,irq-gpio = <&pio 1 0x2001>: GPIO 1, rising edge,
-// active high (the MediaTek pinctrl flag bits).
+#ifdef CONFIG_XNU_DW_FOCALTECH_IRQ_GPIO
+#define FTS_BOARD_IRQ_GPIO (CONFIG_XNU_DW_FOCALTECH_IRQ_GPIO)
+#else
 #define FTS_BOARD_IRQ_GPIO 1
+#endif
 #define FTS_BOARD_IRQ_FLAGS 0x2001u
 
-// merlin.dts &touch: tpd-resolution = <1080 2340>.
+#ifdef CONFIG_XNU_DW_FOCALTECH_X_MAX
+#define FTS_BOARD_X_MAX (CONFIG_XNU_DW_FOCALTECH_X_MAX)
+#else
 #define FTS_BOARD_X_MAX 1080
-#define FTS_BOARD_Y_MAX 2340
-// merlin.dts &touch: tpd-max-touch-num = <10>.
-#define FTS_BOARD_MAX_POINTS 10
+#endif
 
-// The panel is mounted in its natural orientation on merlinx. Change these
-// only with a photograph of the touch axes, not by guessing.
+#ifdef CONFIG_XNU_DW_FOCALTECH_Y_MAX
+#define FTS_BOARD_Y_MAX (CONFIG_XNU_DW_FOCALTECH_Y_MAX)
+#else
+#define FTS_BOARD_Y_MAX 2340
+#endif
+
+#ifdef CONFIG_XNU_DW_FOCALTECH_MAX_POINTS
+#define FTS_BOARD_MAX_POINTS (CONFIG_XNU_DW_FOCALTECH_MAX_POINTS)
+#else
+#define FTS_BOARD_MAX_POINTS 10
+#endif
+
+#ifdef CONFIG_XNU_DW_FOCALTECH_SWAP_XY
+#define FTS_BOARD_SWAP_XY (CONFIG_XNU_DW_FOCALTECH_SWAP_XY)
+#else
 #define FTS_BOARD_SWAP_XY 0
+#endif
+
+#ifdef CONFIG_XNU_DW_FOCALTECH_INVERT_X
+#define FTS_BOARD_INVERT_X (CONFIG_XNU_DW_FOCALTECH_INVERT_X)
+#else
 #define FTS_BOARD_INVERT_X 0
+#endif
+
+#ifdef CONFIG_XNU_DW_FOCALTECH_INVERT_Y
+#define FTS_BOARD_INVERT_Y (CONFIG_XNU_DW_FOCALTECH_INVERT_Y)
+#else
 #define FTS_BOARD_INVERT_Y 0
+#endif
 
 static inline struct fts_core_config fts_board_core_config(void)
 {

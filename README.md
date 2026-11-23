@@ -1,3 +1,10 @@
+# FocalTechTouch-FT8719
+
+> **Status (2026-11-23)**
+> - **iPadOS 17.7.11 (`21H461`)**: Confirmed working on hardware (SPI0 firmware download + real-time HID touch injection), **not yet fully stress-tested**.
+> - **iOS 16.7.16 (`20H392`)**: Confirmed working on hardware (`stage 3/3 err 0`, `id8719 ver10`, live touch frames delivered).
+> - **Unified Config**: See [`configs/example.config`](configs/example.config) for `CONFIG_XNU_DW_FOCALTECH_*` parameters (`SPI_HZ`, `SPI_CS`, `RESET_GPIO`, `IRQ_GPIO`, `X_MAX`, `Y_MAX`, `MAX_POINTS`, `SWAP_XY`, `INVERT_X`, `INVERT_Y`), overridden by `UniXNU-merlinx/configs/merlinx-iOS16.7.config`.
+
 # UniXNU FT8719 FocalTech Touch
 
 [English](README.md) | [简体中文](README.zh-CN.md)
